@@ -1,4 +1,4 @@
-"""HeadroomEngine — request/response hook facade (Chunk 2 + 4.2a/4.2b).
+"""HeadroomEngine — request/response hook facade (Chunk 2 + 4.2a/4.2b/4.2c).
 
 Composes the existing compression subsystems behind a clean hook interface.
 Does NOT reimplement compression; delegates to injected ``CompressionPipeline``
@@ -22,6 +22,27 @@ Design notes
   proactive expansion) AFTER compression-core, using the SAME callables the
   handler uses. Memory injection (4.2c) runs between compression tracking and
   proactive expansion — the ordering seam is clearly marked.
+- **Chunk 4.2c — memory injection**: when ``memory_components`` is provided,
+  the engine calls the synchronous ``fetch_context`` seam (injected by the
+  host) and appends the returned context string to the latest non-frozen user
+  turn (via the ported ``_append_context_to_latest_non_frozen_user_turn``
+  helper). Cache-mode and bypass requests skip injection. The engine never
+  ``await``s — the async search is the host's concern; the engine only handles
+  the deterministic placement step.
+
+  **4.3 async-bridge note** (decided here, implemented in 4.3):
+  In production the host (server.py) must satisfy ``fetch_context`` as a
+  *synchronous* callable. Two options for the async handler:
+    (a) Pre-fetch: ``await memory_handler.search_and_format_context(...)``
+        in the async handler body, then pass a ``lambda *_: result`` closure
+        to ``MemoryComponents``. This is the simplest strategy and avoids
+        any thread-pool gymnastics.
+    (b) Thread-pool bridge: ``asyncio.get_event_loop().run_in_executor(...)``
+        wrapping the coroutine, driven synchronously in the engine.
+  Option (a) is strongly preferred. It keeps the engine fully sync, puts the
+  await at the handler boundary where FastAPI/anyio already manage the event
+  loop, and has zero risk of deadlock. ``MemoryComponents`` is designed so
+  that option (a) is the natural fit: pre-fetch, then pass the result.
 """
 
 from __future__ import annotations
@@ -89,6 +110,54 @@ class AnthropicComponents:
         self.get_compression_cache = get_compression_cache
         self.config = config
         self.usage_reporter = usage_reporter
+
+
+class MemoryComponents:
+    """Injectable memory-injection components for the engine (Chunk 4.2c).
+
+    The engine owns the **injection** step (deterministic placement into the
+    latest non-frozen user turn). The **async search** is the host's concern —
+    it must be resolved to a plain string (or None) before calling
+    ``engine.on_request``, and handed to the engine via the synchronous
+    ``fetch_context`` seam.
+
+    When this is ``None`` on ``HeadroomEngine``, the memory step is a no-op
+    (byte-identical to the pre-4.2c behaviour for all existing tests).
+
+    Parameters
+    ----------
+    fetch_context:
+        Synchronous callable with signature::
+
+            fetch_context(
+                messages: list[dict],
+                query: str,
+                ctx: RequestContext,
+            ) -> str | None
+
+        The engine calls this once per request (when the decision gate passes).
+        Return ``None`` or ``""`` to skip injection.  The callable MUST NOT
+        ``await`` — see the module-level 4.3 async-bridge note for how the
+        production host satisfies this seam.
+    memory_handler:
+        The live memory handler instance (or ``None``). Used only for the
+        ``inject_context`` sub-gate check (``memory_handler.config.inject_context``).
+        Pass ``None`` to skip injection unconditionally (same as no components).
+    user_id:
+        Per-request user_id (from ``x-headroom-user-id`` or env default).
+        Empty string or ``None`` → injection gate fails → no-op.
+    """
+
+    def __init__(
+        self,
+        *,
+        fetch_context: Callable[[list[Any], str, Any], str | None],
+        memory_handler: Any | None,
+        user_id: str | None,
+    ) -> None:
+        self.fetch_context = fetch_context
+        self.memory_handler = memory_handler
+        self.user_id = user_id
 
 
 class CCRComponents:
@@ -172,6 +241,11 @@ class HeadroomEngine:
         When set (and anthropic_components is also set), the engine runs the
         full CCR request-side pipeline after compression-core (Chunk 4.2b).
         When None, CCR steps are a no-op — existing CCR-OFF tests are unchanged.
+    memory_components:
+        When set (and anthropic_components is also set), the engine runs the
+        memory injection step between CCR compression tracking and CCR
+        proactive expansion (Chunk 4.2c). When None, memory step is a no-op
+        — existing tests are byte-identical to the pre-4.2c behaviour.
     """
 
     def __init__(
@@ -183,6 +257,7 @@ class HeadroomEngine:
         salt: bytes,
         anthropic_components: AnthropicComponents | None = None,
         ccr_components: CCRComponents | None = None,
+        memory_components: MemoryComponents | None = None,
     ) -> None:
         self._pipelines = dict(pipelines)
         self._config = config
@@ -190,6 +265,7 @@ class HeadroomEngine:
         self._salt = salt
         self._anthropic_components = anthropic_components
         self._ccr_components = ccr_components
+        self._memory_components = memory_components
 
     # ── Request hook ──────────────────────────────────────────────────────────
 
@@ -247,7 +323,7 @@ class HeadroomEngine:
             insertion point. Do NOT move step 4 above that comment.
 
         Excluded from this chunk: hooks, pipeline_extension events, security
-        scan, traffic_learner, memory injection (4.2c).
+        scan, traffic_learner.
         """
         from headroom.cache.compression_cache import CompressionCache  # noqa: F401
         from headroom.proxy.helpers import (
@@ -542,12 +618,45 @@ class HeadroomEngine:
                             request_id,
                         )
 
-        # ── 4.2c SEAM: memory injection goes here ────────────────────────────
-        # Memory injection (Chunk 4.2c) must run AFTER compression tracking
-        # (step 3 above) and BEFORE proactive expansion (step 4 below).
-        # Insert the memory injection call at this exact location. The
-        # injected context should be appended to the latest non-frozen user
-        # turn via AnthropicHandlerMixin._append_context_to_latest_non_frozen_user_turn.
+        # ── Memory injection (Chunk 4.2c) ────────────────────────────────────
+        # Runs AFTER compression tracking (step 3) and BEFORE proactive
+        # expansion (step 4). Mirrors handler lines ~1424-1504.
+        # When memory_components is None this entire block is skipped —
+        # preserving byte-identical output for all pre-4.2c tests.
+        mc = self._memory_components
+        if mc is not None and not _bypass:
+            from headroom.proxy.helpers import get_memory_injection_mode
+            from headroom.proxy.memory_decision import MemoryDecision
+
+            mem_decision = MemoryDecision.decide(
+                headers=ctx.headers_view,
+                memory_handler=mc.memory_handler,
+                memory_user_id=mc.user_id,
+                mode_name=get_memory_injection_mode(),
+            )
+            if mem_decision.inject:
+                # Sub-gate: inject_context flag on the memory handler config.
+                _inject_ctx = mc.memory_handler is not None and getattr(
+                    getattr(mc.memory_handler, "config", None), "inject_context", True
+                )
+                if _inject_ctx:
+                    from headroom.utils import extract_user_query as _extract_q
+
+                    _user_query = _extract_q(optimized_messages) or ""
+                    memory_context = mc.fetch_context(optimized_messages, _user_query, ctx)
+                    if memory_context and not is_cache_mode(ac.config.mode):
+                        optimized_messages = _append_context_to_latest_non_frozen_user_turn(
+                            optimized_messages,
+                            memory_context,
+                            frozen_message_count=frozen_message_count,
+                        )
+                        body_mutation_tracker.mark_mutated("memory_injection")
+                        logger.debug(
+                            "[%s] Memory(engine): injected %d bytes into latest "
+                            "non-frozen user turn",
+                            request_id,
+                            len(memory_context),
+                        )
         # ─────────────────────────────────────────────────────────────────────
 
         # Step 4: proactive expansion ─────────────────────────────────────────
@@ -603,9 +712,7 @@ class HeadroomEngine:
                                 request_id,
                             )
                         else:
-                            from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
-
-                            optimized_messages = AnthropicHandlerMixin._append_context_to_latest_non_frozen_user_turn(
+                            optimized_messages = _append_context_to_latest_non_frozen_user_turn(
                                 optimized_messages,
                                 expansion_text,
                                 frozen_message_count=frozen_message_count,
@@ -741,6 +848,55 @@ class HeadroomEngine:
 
 
 # ── Private helpers (mirrors static methods on AnthropicHandlerMixin) ─────────
+
+
+def _append_context_to_latest_non_frozen_user_turn(
+    messages: list[dict[str, Any]],
+    context_text: str,
+    *,
+    frozen_message_count: int,
+) -> list[dict[str, Any]]:
+    """Append context to the first text block of the latest non-frozen user turn.
+
+    Direct port of ``AnthropicHandlerMixin._append_context_to_latest_non_frozen_user_turn``.
+    Used by both the memory injection step (4.2c) and the CCR proactive-expansion
+    step (4.2b) in ``_on_request_anthropic_real``.
+
+    Returns the input list unchanged if no eligible user text block exists
+    (last message is an assistant turn, a tool result, or has no text block).
+    """
+    if not messages or not context_text:
+        return messages
+
+    i = len(messages) - 1
+    if i < frozen_message_count:
+        return messages
+    msg = messages[i]
+    if msg.get("role") != "user":
+        return messages
+
+    content = msg.get("content", "")
+    if isinstance(content, str):
+        updated = list(messages)
+        updated[i] = {**msg, "content": content + "\n\n" + context_text}
+        return updated
+
+    if isinstance(content, list) and content:
+        new_content: list[dict[str, Any]] = []
+        appended = False
+        for block in content:
+            if not appended and isinstance(block, dict) and block.get("type") == "text":
+                existing = block.get("text", "")
+                new_content.append({**block, "text": existing + "\n\n" + context_text})
+                appended = True
+            else:
+                new_content.append(block)
+        if appended:
+            updated = list(messages)
+            updated[i] = {**msg, "content": new_content}
+            return updated
+
+    return messages
 
 
 def _resolve_ccr_workspace(
