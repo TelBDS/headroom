@@ -219,6 +219,7 @@ jobs:
           files: coverage-${{ matrix.shard }}.xml
           flags: python
           name: python-shard-${{ matrix.shard }}
+          token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: true
 
   test-extras:
